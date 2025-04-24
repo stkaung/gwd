@@ -18,10 +18,10 @@ if (admin.apps.length === 0) {
 
 const db = admin.firestore();
 
-const usersCollection = db.collection("users");
-const subscriptionsCollection = db.collection("subscriptions");
+export const usersCollection = db.collection("users");
+export const subscriptionsCollection = db.collection("subscriptions");
 
-export async function addSubscription(discordId, groupId, moderationPrompt, stripe, channelId) {
+export async function addSubscription(discordId, groupId, moderationPrompt, stripe, channelId, moderationServices = ["deletions"]) {
   try {
     // Generate random IDs for subscription and stripe customer
     const subscriptionId = `sub_${uuidv4()}`;
@@ -52,7 +52,8 @@ export async function addSubscription(discordId, groupId, moderationPrompt, stri
       startDate: admin.firestore.FieldValue.serverTimestamp(),
       subscriptionId,
       stripe: stripe,
-      channelId: channelId
+      channelId: channelId,
+      moderationServices: moderationServices
     };
 
     // Add subscription to the subscriptions collection
@@ -120,6 +121,14 @@ export async function cancelSubscription(discordId, groupId) {
       .where("discordId", "==", discordId)
       .get();
     
+    try {
+      // Import here to avoid circular dependency
+      const { stopMonitoringGroup } = await import("./nobloxService.js");
+      await stopMonitoringGroup(groupId);
+    } catch (error) {
+      console.error("Error stopping group monitoring:", error);
+    }
+    
     await leaveGroup(groupId)
 
     // Return whether they have any subscriptions left
@@ -180,12 +189,12 @@ export async function getLogs(groupId, robloxId) {
       throw new Error("groupId and robloxId are required");
     }
 
-    // Get logs from Firebase
+    // Get logs from Firebase for all moderation types
     const logsSnapshot = await db
       .collection("logs")
-      .where("groupId", "==", groupId)
+      .where("groupId", "==", groupId.toString())
       .where("robloxId", "==", robloxId.toString())
-      .where("type", "==", "deletion")
+      .orderBy("issuedDate", "desc") // Sort by newest first
       .get();
 
     if (logsSnapshot.empty) {
@@ -204,6 +213,47 @@ export async function getLogs(groupId, robloxId) {
     return logs;
   } catch (error) {
     console.error("Error getting logs:", error);
+    throw error;
+  }
+}
+
+/**
+ * Log a moderation action in Firestore
+ * @param {Object} logData - Log data object
+ * @param {string} logData.type - Type of action (deletion, exile, demotion)
+ * @param {string} logData.groupId - Group ID
+ * @param {string} logData.robloxId - Roblox user ID
+ * @param {string} logData.message - The content that was moderated (optional)
+ * @param {string} logData.reason - Reason for moderation
+ * @param {string} logData.botId - Bot's Roblox ID
+ * @returns {Promise<string>} ID of the created log
+ */
+export async function logModeration(logData) {
+  try {
+    if (!logData.groupId || !logData.robloxId || !logData.type || !logData.botId) {
+      throw new Error("Missing required log data");
+    }
+
+    // Valid log types
+    const validTypes = ["deletion", "exile", "ban", "demotion"];
+    if (!validTypes.includes(logData.type)) {
+      throw new Error(`Invalid log type: ${logData.type}. Must be one of: ${validTypes.join(", ")}`);
+    }
+
+    // Create log entry
+    const logEntry = {
+      ...logData,
+      issuedDate: admin.firestore.FieldValue.serverTimestamp(),
+      robloxId: logData.robloxId.toString() // Ensure robloxId is a string
+    };
+
+    // Add to Firestore
+    const docRef = await db.collection("logs").add(logEntry);
+    console.log(`Created moderation log: ${docRef.id} (${logData.type})`);
+    
+    return docRef.id;
+  } catch (error) {
+    console.error("Error logging moderation action:", error);
     throw error;
   }
 }
@@ -258,7 +308,7 @@ export async function updateModerationCriteria(discordId, groupId, newCriteria) 
 
     const updatePromises = subscriptionsSnapshot.docs.map((doc) =>
       doc.ref.update({
-        moderationCriteria: newCriteria,
+        moderationPrompt: newCriteria,
       })
     );
 
@@ -268,6 +318,39 @@ export async function updateModerationCriteria(discordId, groupId, newCriteria) 
     );
   } catch (error) {
     console.error("Error updating moderation criteria:", error);
+    throw error;
+  }
+}
+
+export async function updateSubscriptionEndDate(discordId, groupId, endDate) {
+  try {
+    if (!discordId || !groupId || !endDate) {
+      throw new Error("discordId, groupId, and endDate are required");
+    }
+
+    const subscriptionsSnapshot = await subscriptionsCollection
+      .where("discordId", "==", discordId)
+      .where("groupId", "==", groupId)
+      .get();
+
+    if (subscriptionsSnapshot.empty) {
+      throw new Error("No subscription found");
+    }
+
+    const updatePromises = subscriptionsSnapshot.docs.map((doc) =>
+      doc.ref.update({
+        endDate: admin.firestore.Timestamp.fromDate(endDate),
+        cancelled: true
+      })
+    );
+
+    await Promise.all(updatePromises);
+    console.log(
+      `Marked subscription as cancelled for discord ID ${discordId} and group ${groupId}, ending on ${endDate}`
+    );
+    return true;
+  } catch (error) {
+    console.error("Error updating subscription end date:", error);
     throw error;
   }
 }
@@ -302,23 +385,24 @@ export async function getSubscription(discordId, groupId) {
       throw new Error("discordId and groupId are required");
     }
 
-    // Get the subscription document
     const subscriptionsSnapshot = await subscriptionsCollection
       .where("discordId", "==", discordId)
       .where("groupId", "==", groupId)
       .limit(1)
       .get();
 
-    // Return the first (and should be only) subscription
-    const subscription = subscriptionsSnapshot.docs[0].data();
+    if (subscriptionsSnapshot.empty) {
+      return null;
+    }
+
+    // Return the first matching subscription (should only be one)
     return {
-      ...subscription,
       id: subscriptionsSnapshot.docs[0].id,
-      stripeCustomerId: discordId, // Just return the Discord ID as the Stripe customer ID
+      ...subscriptionsSnapshot.docs[0].data(),
     };
   } catch (error) {
     console.error("Error getting subscription:", error);
-    throw error;
+    return null;
   }
 }
 
@@ -358,7 +442,7 @@ getAllSubscriptions().then(result =>
 export async function getSubscriptionByGroup(groupId) {
   try {
     if (!groupId) {
-      throw new Error("discordId and groupId are required");
+      throw new Error("groupId is required");
     }
 
     // Get the subscription document
@@ -367,9 +451,15 @@ export async function getSubscriptionByGroup(groupId) {
       .limit(1)
       .get();
 
+    // Check if any subscriptions were found
+    if (subscriptionsSnapshot.empty) {
+      console.log(`No subscription found for group ${groupId}`);
+      return null;
+    }
+
     // Return the first (and should be only) subscription
     const subscription = subscriptionsSnapshot.docs[0].data();
-    console.log(subscription)
+    console.log(subscription);
     return {
       ...subscription,
       id: subscriptionsSnapshot.docs[0].id,
@@ -384,6 +474,47 @@ export async function getSubscriptionByGroup(groupId) {
   }
 }
 
+export async function updateModerationServices(discordId, groupId, services) {
+  try {
+    if (!discordId || !groupId || !services || !Array.isArray(services)) {
+      throw new Error("discordId, groupId, and services array are required");
+    }
+
+    // Validate that services contains valid options
+    const validServices = ["deletions", "exiles", "demotions"];
+    const validatedServices = services.filter(service => validServices.includes(service));
+
+    if (validatedServices.length === 0) {
+      validatedServices.push("deletions"); // At minimum, include deletions service
+    }
+
+    // Get the subscription documents
+    const subscriptionsSnapshot = await subscriptionsCollection
+      .where("discordId", "==", discordId)
+      .where("groupId", "==", groupId)
+      .get();
+
+    if (subscriptionsSnapshot.empty) {
+      throw new Error("No subscription found");
+    }
+
+    // Update the moderationServices field for each matching subscription
+    const updatePromises = subscriptionsSnapshot.docs.map((doc) =>
+      doc.ref.update({
+        moderationServices: validatedServices,
+      })
+    );
+
+    await Promise.all(updatePromises);
+    
+    console.log(`Updated moderation services for discord ID ${discordId} and group ${groupId} to:`, validatedServices);
+    return validatedServices;
+  } catch (error) {
+    console.error("Error updating moderation services:", error);
+    throw error;
+  }
+}
+
 export default {
   addSubscription,
   cancelSubscription,
@@ -391,6 +522,8 @@ export default {
   getLogs,
   updateSubscriptionGroup,
   updateModerationCriteria,
+  updateSubscriptionEndDate,
+  updateModerationServices,
   getModerationCriteria,
   getSubscription,
   getSubscriptionByGroup
